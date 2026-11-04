@@ -2,13 +2,13 @@ name: Bybit RSI Alert
 
 on:
   schedule:
-    # 매시간 정각마다 실행 (1회 실행 시 55분간 30초 주기로 연속 감시)
-    - cron: '0 * * * *'
+    # 정각 혼잡을 피해 매 15분마다 대기열 생성 (끊김 없는 이어달리기)
+    - cron: '2,17,32,47 * * * *'
   workflow_dispatch:
 
 concurrency:
   group: bybit-rsi-bot
-  cancel-in-progress: true
+  cancel-in-progress: false  # 실행 중인 봇을 강제 종료하지 않고 끝나면 즉시 이어서 실행
 
 permissions:
   contents: write
