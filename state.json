@@ -18,5 +18,9 @@
   "ETH_4h": {
     "status": "OVERBOUGHT",
     "candle_time": 1793793600000
+  },
+  "BTC_4h": {
+    "status": "OVERBOUGHT",
+    "candle_time": 1793793600000
   }
 }
