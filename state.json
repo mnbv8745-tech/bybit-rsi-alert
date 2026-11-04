@@ -20,7 +20,7 @@
     "candle_time": 1793793600000
   },
   "BTC_4h": {
-    "status": "OVERBOUGHT",
+    "status": "NORMAL",
     "candle_time": 1793793600000
   }
 }
