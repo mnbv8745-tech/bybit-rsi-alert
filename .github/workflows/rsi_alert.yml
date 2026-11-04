@@ -2,16 +2,17 @@ name: Bybit RSI Alert
 
 on:
   schedule:
-    # 정각 혼잡을 피해 매 15분마다 대기열 생성 (끊김 없는 이어달리기)
-    - cron: '2,17,32,47 * * * *'
+    # 5분마다 스케줄 대기열 생성 (공백 최소화)
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 concurrency:
   group: bybit-rsi-bot
-  cancel-in-progress: false  # 실행 중인 봇을 강제 종료하지 않고 끝나면 즉시 이어서 실행
+  cancel-in-progress: false  # 이미 돌고 있는 봇은 끄지 않고 끝나는 즉시 이어받기
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   check-rsi:
@@ -27,11 +28,12 @@ jobs:
 
       - name: 필수 라이브러리 설치
         run: |
-          pip install ccxt pandas requests
+          pip install requests pandas
 
       - name: RSI 실시간 감시 실행
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python rsi_alert.py
