@@ -1,1 +1,18 @@
-{}
+{
+  "BTC_15m": {
+    "status": "OVERBOUGHT",
+    "candle_time": 1793802600000
+  },
+  "BTC_1h": {
+    "status": "OVERBOUGHT",
+    "candle_time": 1793800800000
+  },
+  "ETH_15m": {
+    "status": "OVERBOUGHT",
+    "candle_time": 1793802600000
+  },
+  "ETH_1h": {
+    "status": "OVERBOUGHT",
+    "candle_time": 1793800800000
+  }
+}
