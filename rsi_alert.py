@@ -2,22 +2,21 @@ import os
 import json
 import time
 import subprocess
+import urllib.parse
 import requests
-import ccxt
 import pandas as pd
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
 
-SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+COINS = ["BTC", "ETH"]
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
 
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30.0
 RSI_OVERBOUGHT = 70.0
 
-# RSI가 34 이상(또는 66 이하)으로 회복되면 즉시 다음 알람 대기 상태로 잠금 해제
 RESET_OVERSOLD = 34.0
 RESET_OVERBOUGHT = 66.0
 
@@ -25,23 +24,7 @@ STATE_FILE = "state.json"
 LOOP_DURATION_SECONDS = 50 * 60  # 50분간 연속 감시
 CHECK_INTERVAL_SECONDS = 25      # 25초마다 체크
 
-# 미국 깃허브 서버 IP 차단(403)을 피하기 위해 bytick.com 우회 도메인 사용
-exchange_primary = ccxt.bybit({
-    'hostname': 'bytick.com',
-    'enableRateLimit': True,
-    'options': {'defaultType': 'linear'}
-})
-
-exchange_fallback = ccxt.bybit({
-    'enableRateLimit': True,
-    'options': {'defaultType': 'linear'}
-})
-
-def fetch_ohlcv_safe(symbol: str, tf: str, limit: int = 100):
-    try:
-        return exchange_primary.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    except Exception:
-        return exchange_fallback.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -54,6 +37,71 @@ def send_telegram(text: str):
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"텔레그램 전송 실패: {e}")
+
+def fetch_futures_ohlcv(coin: str, tf: str) -> list:
+    """트레이딩뷰 RSI와 오차를 줄이기 위해 200개 캔들 조회 (우회 프록시 우선 사용)"""
+    symbol = f"{coin}USDT"
+    bybit_map = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+    bybit_iv = bybit_map[tf]
+
+    # 1순위: 바이비트 V5 선물 API (프록시 우회 포함 200개 캔들)
+    bybit_target = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={bybit_iv}&limit=200"
+    encoded_target = urllib.parse.quote(bybit_target, safe='')
+    bybit_urls = [
+        f"https://api.allorigins.win/raw?url={encoded_target}",
+        f"https://api.codetabs.com/v1/proxy?quest={encoded_target}",
+        bybit_target,
+        f"https://api.bytick.com/v5/market/kline?category=linear&symbol={symbol}&interval={bybit_iv}&limit=200"
+    ]
+
+    for url in bybit_urls:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8)
+            if r.status_code == 200:
+                data = r.json()
+                raw_list = data.get("result", {}).get("list", [])
+                if raw_list and len(raw_list) >= RSI_PERIOD + 10:
+                    rows = [
+                        [int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])]
+                        for x in raw_list
+                    ]
+                    rows.sort(key=lambda x: x[0])
+                    return rows
+        except Exception:
+            pass
+
+    # 2순위: Bitget USDT 무기한 선물 (200개 캔들)
+    bitget_map = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc"}
+    bitget_url = (
+        f"https://api.bitget.com/api/v2/mix/market/candles"
+        f"?symbol={symbol}&productType=USDT-FUTURES&granularity={bitget_map[tf]}&limit=200"
+    )
+    try:
+        r = requests.get(bitget_url, headers=HEADERS, timeout=8)
+        if r.status_code == 200:
+            data = r.json()
+            raw_list = data.get("data", [])
+            if raw_list and len(raw_list) >= RSI_PERIOD + 10:
+                rows = [
+                    [int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])]
+                    for x in raw_list
+                ]
+                rows.sort(key=lambda x: x[0])
+                return rows
+    except Exception:
+        pass
+
+    # 3순위: OKX USDT 무기한 선물 (200개 캔들)
+    okx_url = f"https://www.okx.com/api/v5/market/candles?instId={coin}-USDT-SWAP&bar={bitget_map[tf]}&limit=200"
+    r = requests.get(okx_url, headers=HEADERS, timeout=8)
+    data = r.json()
+    raw_list = data.get("data", [])
+    rows = [
+        [int(x[0]), float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])]
+        for x in raw_list
+    ]
+    rows.sort(key=lambda x: x[0])
+    return rows
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -77,6 +125,22 @@ def save_state_to_github(state):
     except Exception as e:
         print(f"Git 상태 저장 오류: {e}")
 
+def trigger_next_run():
+    """50분 종료 직전 다음 워크플로우를 즉시 호출하여 공백 방지"""
+    token = os.environ.get("GITHUB_TOKEN")
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if not token or not repo:
+        return
+    url = f"https://api.github.com/repos/{repo}/actions/workflows/rsi_alert.yml/dispatches"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json"
+    }
+    try:
+        requests.post(url, headers=headers, json={"ref": "main"}, timeout=8)
+    except Exception as e:
+        print(f"다음 실행 호출 실패: {e}")
+
 def calc_rsi_series(close_series: pd.Series, period: int = 14) -> pd.Series:
     delta = close_series.diff()
     gain = delta.clip(lower=0)
@@ -86,92 +150,104 @@ def calc_rsi_series(close_series: pd.Series, period: int = 14) -> pd.Series:
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-def get_candle_rsi(df: pd.DataFrame, period: int = 14):
-    curr_rsi = float(calc_rsi_series(df['close'], period).iloc[-1])
+def get_candle_rsi_at(df: pd.DataFrame, idx: int, period: int = 14):
+    """특정 인덱스(idx: -1 현재봉, -2 직전봉 등) 시점의 종가 및 고가/저가 꼬리 RSI 계산"""
+    sub_df = df.iloc[:len(df) + idx + 1].copy() if idx < -1 else df.copy()
+    close_rsi = float(calc_rsi_series(sub_df['close'], period).iloc[-1])
 
-    low_series = df['close'].copy()
-    low_series.iloc[-1] = df['low'].iloc[-1]
+    low_series = sub_df['close'].copy()
+    low_series.iloc[-1] = sub_df['low'].iloc[-1]
     low_rsi = float(calc_rsi_series(low_series, period).iloc[-1])
 
-    high_series = df['close'].copy()
-    high_series.iloc[-1] = df['high'].iloc[-1]
+    high_series = sub_df['close'].copy()
+    high_series.iloc[-1] = sub_df['high'].iloc[-1]
     high_rsi = float(calc_rsi_series(high_series, period).iloc[-1])
 
-    return round(curr_rsi, 2), round(low_rsi, 2), round(high_rsi, 2)
+    return round(close_rsi, 2), round(low_rsi, 2), round(high_rsi, 2), int(sub_df['timestamp'].iloc[-1])
 
 def check_market(state: dict, send_summary: bool = False) -> bool:
     state_changed = False
     summary_lines = ["📊 *[Bybit RSI 실시간 가동 점검]*"]
 
-    for symbol in SYMBOLS:
-        coin = symbol.split('/')[0]
+    for coin in COINS:
         tf_texts = []
         for tf in TIMEFRAMES:
             key = f"{coin}_{tf}"
             try:
-                ohlcv = fetch_ohlcv_safe(symbol, tf, limit=100)
-                if not ohlcv or len(ohlcv) < RSI_PERIOD + 2:
+                ohlcv = fetch_futures_ohlcv(coin, tf)
+                if not ohlcv or len(ohlcv) < RSI_PERIOD + 10:
+                    tf_texts.append(f"{tf}: 데이터부족")
                     continue
 
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                curr_rsi, low_rsi, high_rsi = get_candle_rsi(df, RSI_PERIOD)
-                curr_candle_time = int(df['timestamp'].iloc[-1])
+                curr_rsi, curr_low_rsi, curr_high_rsi, curr_candle_time = get_candle_rsi_at(df, -1, RSI_PERIOD)
                 curr_price = float(df['close'].iloc[-1])
 
                 tf_texts.append(f"{tf}: `{curr_rsi}`")
 
                 item_state = state.get(key, {"status": "NORMAL", "candle_time": 0})
                 status = item_state.get("status", "NORMAL")
-                last_candle_time = item_state.get("candle_time", 0)
+                last_alert_candle = item_state.get("candle_time", 0)
 
-                # 1. 정상 범위(34~66) 복귀 시 즉시 잠금 해제
+                # 1. 정상 범위(34~66) 복귀 시 잠금 해제
                 if status == "OVERSOLD" and curr_rsi >= RESET_OVERSOLD:
                     status = "NORMAL"
-                    state[key] = {"status": "NORMAL", "candle_time": curr_candle_time}
+                    state[key] = {"status": "NORMAL", "candle_time": last_alert_candle}
                     state_changed = True
 
                 elif status == "OVERBOUGHT" and curr_rsi <= RESET_OVERBOUGHT:
                     status = "NORMAL"
-                    state[key] = {"status": "NORMAL", "candle_time": curr_candle_time}
+                    state[key] = {"status": "NORMAL", "candle_time": last_alert_candle}
                     state_changed = True
 
-                # 2. 과매도(30 이하) 감시 (직전 봉 조건 없이 잠금 상태가 아니면 즉시 발송)
+                # 2. 현재 봉(-1)부터 최근 지나간 봉(-2, -3, -4)까지 스캔하여 스케줄 공백 중 터치까지 포착
+                lookback_indices = [-1] if last_alert_candle == 0 else [-4, -3, -2, -1]
+
                 if status != "OVERSOLD":
-                    is_oversold_now = (curr_rsi <= RSI_OVERSOLD)
-                    is_wick_oversold = (curr_candle_time != last_candle_time) and (low_rsi <= RSI_OVERSOLD)
+                    for idx in lookback_indices:
+                        c_rsi, l_rsi, _, c_time = get_candle_rsi_at(df, idx, RSI_PERIOD)
+                        if c_time <= last_alert_candle:
+                            continue
+                        if c_rsi <= RSI_OVERSOLD or l_rsi <= RSI_OVERSOLD:
+                            min_r = min(c_rsi, l_rsi)
+                            if idx == -1:
+                                touch_info = f"{curr_rsi}" if curr_rsi <= RSI_OVERSOLD else f"{min_r} (꼬리 터치 후 반등, 현재 {curr_rsi})"
+                            else:
+                                touch_info = f"{min_r} (최근 마감봉 터치 포착, 현재 {curr_rsi})"
+                            msg = (
+                                f"🟢 *[RSI 30 이하 터치]*\n"
+                                f"• 코인: *{coin}* (USDT 선물)\n"
+                                f"• 주기: *{tf}*\n"
+                                f"• RSI: *{touch_info}*\n"
+                                f"• 현재가: {curr_price:,.2f} USDT"
+                            )
+                            send_telegram(msg)
+                            state[key] = {"status": "OVERSOLD", "candle_time": curr_candle_time}
+                            state_changed = True
+                            break
 
-                    if is_oversold_now or is_wick_oversold:
-                        touch_info = f"{curr_rsi}" if is_oversold_now else f"{low_rsi} (꼬리 터치 후 반등, 현재 {curr_rsi})"
-                        msg = (
-                            f"🟢 *[RSI 30 이하 터치]*\n"
-                            f"• 코인: *{coin}* (Bybit 선물)\n"
-                            f"• 주기: *{tf}*\n"
-                            f"• RSI: *{touch_info}*\n"
-                            f"• 현재가: {curr_price:,.2f} USDT"
-                        )
-                        send_telegram(msg)
-                        state[key] = {"status": "OVERSOLD", "candle_time": curr_candle_time}
-                        state_changed = True
-                        print(f"[{key}] 과매도 알림 발송 완료")
-
-                # 3. 과매수(70 이상) 감시
-                elif status != "OVERBOUGHT":
-                    is_overbought_now = (curr_rsi >= RSI_OVERBOUGHT)
-                    is_wick_overbought = (curr_candle_time != last_candle_time) and (high_rsi >= RSI_OVERBOUGHT)
-
-                    if is_overbought_now or is_wick_overbought:
-                        touch_info = f"{curr_rsi}" if is_overbought_now else f"{high_rsi} (꼬리 터치 후 조정, 현재 {curr_rsi})"
-                        msg = (
-                            f"🔴 *[RSI 70 이상 터치]*\n"
-                            f"• 코인: *{coin}* (Bybit 선물)\n"
-                            f"• 주기: *{tf}*\n"
-                            f"• RSI: *{touch_info}*\n"
-                            f"• 현재가: {curr_price:,.2f} USDT"
-                        )
-                        send_telegram(msg)
-                        state[key] = {"status": "OVERBOUGHT", "candle_time": curr_candle_time}
-                        state_changed = True
-                        print(f"[{key}] 과매수 알림 발송 완료")
+                if state.get(key, {}).get("status") != "OVERBOUGHT" and status != "OVERBOUGHT":
+                    for idx in lookback_indices:
+                        c_rsi, _, h_rsi, c_time = get_candle_rsi_at(df, idx, RSI_PERIOD)
+                        if c_time <= last_alert_candle:
+                            continue
+                        if c_rsi >= RSI_OVERBOUGHT or h_rsi >= RSI_OVERBOUGHT:
+                            max_r = max(c_rsi, h_rsi)
+                            if idx == -1:
+                                touch_info = f"{curr_rsi}" if curr_rsi >= RSI_OVERBOUGHT else f"{max_r} (꼬리 터치 후 조정, 현재 {curr_rsi})"
+                            else:
+                                touch_info = f"{max_r} (최근 마감봉 터치 포착, 현재 {curr_rsi})"
+                            msg = (
+                                f"🔴 *[RSI 70 이상 터치]*\n"
+                                f"• 코인: *{coin}* (USDT 선물)\n"
+                                f"• 주기: *{tf}*\n"
+                                f"• RSI: *{touch_info}*\n"
+                                f"• 현재가: {curr_price:,.2f} USDT"
+                            )
+                            send_telegram(msg)
+                            state[key] = {"status": "OVERBOUGHT", "candle_time": curr_candle_time}
+                            state_changed = True
+                            break
 
             except Exception as e:
                 print(f"오류 ({key}): {e}")
@@ -188,16 +264,13 @@ def check_market(state: dict, send_summary: bool = False) -> bool:
 def main():
     state, is_first_run = load_state()
 
-    # 수동으로 Run workflow를 누른 경우, 이전 잠금을 모두 초기화하고 현재 RSI 현황판을 즉시 전송
     is_manual = (EVENT_NAME == "workflow_dispatch")
-    if is_manual:
-        state = {}
-        state_changed = check_market(state, send_summary=True)
+    if is_manual and not os.path.exists(STATE_FILE):
+        is_first_run = True
+
+    changed = check_market(state, send_summary=is_first_run or is_manual)
+    if changed or is_first_run:
         save_state_to_github(state)
-    else:
-        state_changed = check_market(state, send_summary=is_first_run)
-        if state_changed or is_first_run:
-            save_state_to_github(state)
 
     start_time = time.time()
     while time.time() - start_time < LOOP_DURATION_SECONDS:
@@ -205,6 +278,9 @@ def main():
         changed = check_market(state, send_summary=False)
         if changed:
             save_state_to_github(state)
+
+    # 50분 루프가 끝나면 다음 워크플로우를 즉시 실행
+    trigger_next_run()
 
 if __name__ == "__main__":
     main()
