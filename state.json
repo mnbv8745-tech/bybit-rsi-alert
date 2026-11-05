@@ -1,7 +1,7 @@
 {
   "BTC_15m": {
-    "status": "NORMAL",
-    "candle_time": 1793886300000
+    "status": "OVERSOLD",
+    "candle_time": 1793887200000
   },
   "BTC_1h": {
     "status": "NORMAL",
