@@ -8,7 +8,6 @@ import pandas as pd
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "")
 
 COINS = ["BTC", "ETH"]
 TIMEFRAMES = ["15m", "1h", "4h", "1d"]
@@ -39,12 +38,10 @@ def send_telegram(text: str):
         print(f"텔레그램 전송 실패: {e}")
 
 def fetch_futures_ohlcv(coin: str, tf: str) -> list:
-    """트레이딩뷰 RSI와 오차를 줄이기 위해 200개 캔들 조회 (우회 프록시 우선 사용)"""
     symbol = f"{coin}USDT"
     bybit_map = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
     bybit_iv = bybit_map[tf]
 
-    # 1순위: 바이비트 V5 선물 API (프록시 우회 포함 200개 캔들)
     bybit_target = f"https://api.bybit.com/v5/market/kline?category=linear&symbol={symbol}&interval={bybit_iv}&limit=200"
     encoded_target = urllib.parse.quote(bybit_target, safe='')
     bybit_urls = [
@@ -70,7 +67,6 @@ def fetch_futures_ohlcv(coin: str, tf: str) -> list:
         except Exception:
             pass
 
-    # 2순위: Bitget USDT 무기한 선물 (200개 캔들)
     bitget_map = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1Dutc"}
     bitget_url = (
         f"https://api.bitget.com/api/v2/mix/market/candles"
@@ -91,7 +87,6 @@ def fetch_futures_ohlcv(coin: str, tf: str) -> list:
     except Exception:
         pass
 
-    # 3순위: OKX USDT 무기한 선물 (200개 캔들)
     okx_url = f"https://www.okx.com/api/v5/market/candles?instId={coin}-USDT-SWAP&bar={bitget_map[tf]}&limit=200"
     r = requests.get(okx_url, headers=HEADERS, timeout=8)
     data = r.json()
@@ -107,12 +102,15 @@ def load_state():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f), False
+                data = json.load(f)
+                if isinstance(data, dict) and data.get("_initialized"):
+                    return data, False
         except Exception:
             pass
-    return {}, True
+    return {"_initialized": True}, True
 
 def save_state_to_github(state):
+    state["_initialized"] = True
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2)
     try:
@@ -120,13 +118,12 @@ def save_state_to_github(state):
         subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=False)
         subprocess.run(["git", "add", STATE_FILE], check=False)
         subprocess.run(["git", "commit", "-m", "Update RSI state [skip ci]"], check=False)
-        subprocess.run(["git", "pull", "--rebase"], check=False)
-        subprocess.run(["git", "push"], check=False)
+        subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
+        subprocess.run(["git", "push", "origin", "HEAD:main"], check=False)
     except Exception as e:
         print(f"Git 상태 저장 오류: {e}")
 
 def trigger_next_run():
-    """50분 종료 직전 다음 워크플로우를 즉시 호출하여 공백 방지"""
     token = os.environ.get("GITHUB_TOKEN")
     repo = os.environ.get("GITHUB_REPOSITORY")
     if not token or not repo:
@@ -151,7 +148,6 @@ def calc_rsi_series(close_series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 def get_candle_rsi_at(df: pd.DataFrame, idx: int, period: int = 14):
-    """특정 인덱스(idx: -1 현재봉, -2 직전봉 등) 시점의 종가 및 고가/저가 꼬리 RSI 계산"""
     sub_df = df.iloc[:len(df) + idx + 1].copy() if idx < -1 else df.copy()
     close_rsi = float(calc_rsi_series(sub_df['close'], period).iloc[-1])
 
@@ -165,25 +161,20 @@ def get_candle_rsi_at(df: pd.DataFrame, idx: int, period: int = 14):
 
     return round(close_rsi, 2), round(low_rsi, 2), round(high_rsi, 2), int(sub_df['timestamp'].iloc[-1])
 
-def check_market(state: dict, send_summary: bool = False) -> bool:
+def check_market(state: dict) -> bool:
     state_changed = False
-    summary_lines = ["📊 *[Bybit RSI 실시간 가동 점검]*"]
 
     for coin in COINS:
-        tf_texts = []
         for tf in TIMEFRAMES:
             key = f"{coin}_{tf}"
             try:
                 ohlcv = fetch_futures_ohlcv(coin, tf)
                 if not ohlcv or len(ohlcv) < RSI_PERIOD + 10:
-                    tf_texts.append(f"{tf}: 데이터부족")
                     continue
 
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 curr_rsi, curr_low_rsi, curr_high_rsi, curr_candle_time = get_candle_rsi_at(df, -1, RSI_PERIOD)
                 curr_price = float(df['close'].iloc[-1])
-
-                tf_texts.append(f"{tf}: `{curr_rsi}`")
 
                 item_state = state.get(key, {"status": "NORMAL", "candle_time": 0})
                 status = item_state.get("status", "NORMAL")
@@ -200,8 +191,8 @@ def check_market(state: dict, send_summary: bool = False) -> bool:
                     state[key] = {"status": "NORMAL", "candle_time": last_alert_candle}
                     state_changed = True
 
-                # 2. 현재 봉(-1)부터 최근 지나간 봉(-2, -3, -4)까지 스캔하여 스케줄 공백 중 터치까지 포착
-                lookback_indices = [-1] if last_alert_candle == 0 else [-4, -3, -2, -1]
+                # 2. 현재 봉(-1)부터 최근 지나간 봉(-2, -3)까지 스캔하여 터치 포착
+                lookback_indices = [-1] if last_alert_candle == 0 else [-3, -2, -1]
 
                 if status != "OVERSOLD":
                     for idx in lookback_indices:
@@ -251,35 +242,23 @@ def check_market(state: dict, send_summary: bool = False) -> bool:
 
             except Exception as e:
                 print(f"오류 ({key}): {e}")
-                tf_texts.append(f"{tf}: 에러")
-
-        if tf_texts:
-            summary_lines.append(f"• *{coin}*: " + " | ".join(tf_texts))
-
-    if send_summary and len(summary_lines) > 1:
-        send_telegram("\n".join(summary_lines))
 
     return state_changed
 
 def main():
     state, is_first_run = load_state()
 
-    is_manual = (EVENT_NAME == "workflow_dispatch")
-    if is_manual and not os.path.exists(STATE_FILE):
-        is_first_run = True
-
-    changed = check_market(state, send_summary=is_first_run or is_manual)
+    changed = check_market(state)
     if changed or is_first_run:
         save_state_to_github(state)
 
     start_time = time.time()
     while time.time() - start_time < LOOP_DURATION_SECONDS:
         time.sleep(CHECK_INTERVAL_SECONDS)
-        changed = check_market(state, send_summary=False)
+        changed = check_market(state)
         if changed:
             save_state_to_github(state)
 
-    # 50분 루프가 끝나면 다음 워크플로우를 즉시 실행
     trigger_next_run()
 
 if __name__ == "__main__":
