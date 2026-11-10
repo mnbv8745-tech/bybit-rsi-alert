@@ -6,7 +6,7 @@
   },
   "ETH_15m": {
     "status": "OVERSOLD",
-    "candle_time": 1794305700000
+    "candle_time": 1794308400000
   },
   "BTC_1h": {
     "status": "NORMAL",
@@ -14,7 +14,7 @@
   },
   "ETH_1h": {
     "status": "OVERSOLD",
-    "candle_time": 1794304800000
+    "candle_time": 1794308400000
   },
   "ETH_4h": {
     "status": "OVERSOLD",
