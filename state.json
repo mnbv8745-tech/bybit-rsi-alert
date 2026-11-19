@@ -10,7 +10,7 @@
   },
   "BTC_1h": {
     "status": "OVERSOLD",
-    "candle_time": 1795122000000
+    "candle_time": 1795125600000
   },
   "ETH_1h": {
     "status": "NORMAL",
