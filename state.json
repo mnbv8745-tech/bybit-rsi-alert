@@ -21,7 +21,7 @@
     "candle_time": 1795233600000
   },
   "BTC_4h": {
-    "status": "OVERSOLD",
+    "status": "NORMAL",
     "candle_time": 1795262400000
   },
   "ETH_1d": {
