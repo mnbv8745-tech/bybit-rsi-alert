@@ -10,7 +10,7 @@
   },
   "BTC_1h": {
     "status": "OVERBOUGHT",
-    "candle_time": 1795766400000
+    "candle_time": 1795770000000
   },
   "ETH_1h": {
     "status": "NORMAL",
